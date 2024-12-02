@@ -38,6 +38,9 @@ enum RequestKind<'a> {
 }
 
 impl<S> GrpcWebService<S> {
+    /// Create a new `GrpcWebService` wrapping the given service.
+    /// The inner service must be a `Service<Request<Body>, Response = Response<Body>>`.
+    /// The inner service is responsible for handling the request and returning a response.
     pub fn new(inner: S) -> Self {
         GrpcWebService { inner }
     }
