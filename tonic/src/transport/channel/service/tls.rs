@@ -1,19 +1,21 @@
 use std::fmt;
-use std::io::Cursor;
 use std::sync::Arc;
 
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{
     rustls::{
+        crypto,
         pki_types::{ServerName, TrustAnchor},
-        ClientConfig, RootCertStore,
+        ClientConfig, ConfigBuilder, RootCertStore, WantsVerifier,
     },
     TlsConnector as RustlsConnector,
 };
 
 use super::io::BoxedIo;
-use crate::transport::service::tls::{add_certs_from_pem, load_identity, TlsError, ALPN_H2};
+use crate::transport::service::tls::{
+    convert_certificate_to_pki_types, convert_identity_to_pki_types, TlsError, ALPN_H2,
+};
 use crate::transport::tls::{Certificate, Identity};
 
 #[derive(Clone)]
@@ -33,7 +35,25 @@ impl TlsConnector {
         #[cfg(feature = "tls-native-roots")] with_native_roots: bool,
         #[cfg(feature = "tls-webpki-roots")] with_webpki_roots: bool,
     ) -> Result<Self, crate::BoxError> {
-        let builder = ClientConfig::builder();
+        fn with_provider(
+            provider: Arc<crypto::CryptoProvider>,
+        ) -> ConfigBuilder<ClientConfig, WantsVerifier> {
+            ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+        }
+
+        #[allow(unreachable_patterns)]
+        let builder = match crypto::CryptoProvider::get_default() {
+            Some(provider) => with_provider(provider.clone()),
+            #[cfg(feature = "tls-ring")]
+            None => with_provider(Arc::new(crypto::ring::default_provider())),
+            #[cfg(feature = "tls-aws-lc")]
+            None => with_provider(Arc::new(crypto::aws_lc_rs::default_provider())),
+            // somehow tls is enabled, but neither of the crypto features are enabled.
+            _ => ClientConfig::builder(),
+        };
+
         let mut roots = RootCertStore::from_iter(trust_anchors);
 
         #[cfg(feature = "tls-native-roots")]
@@ -55,13 +75,13 @@ impl TlsConnector {
         }
 
         for cert in ca_certs {
-            add_certs_from_pem(&mut Cursor::new(cert), &mut roots)?;
+            roots.add_parsable_certificates(convert_certificate_to_pki_types(&cert)?);
         }
 
         let builder = builder.with_root_certificates(roots);
         let mut config = match identity {
             Some(identity) => {
-                let (client_cert, client_key) = load_identity(identity)?;
+                let (client_cert, client_key) = convert_identity_to_pki_types(&identity)?;
                 builder.with_client_auth_cert(client_cert, client_key)?
             }
             None => builder.with_no_client_auth(),

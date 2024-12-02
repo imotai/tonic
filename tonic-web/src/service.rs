@@ -1,12 +1,12 @@
+use core::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
 use http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version};
-use http_body_util::BodyExt;
 use pin_project::pin_project;
 use tonic::metadata::GRPC_CONTENT_TYPE;
-use tonic::{body::BoxBody, server::NamedService};
+use tonic::{body::Body, server::NamedService};
 use tower_service::Service;
 use tracing::{debug, trace};
 
@@ -45,7 +45,7 @@ impl<S> GrpcWebService<S> {
 
 impl<S> GrpcWebService<S>
 where
-    S: Service<Request<BoxBody>, Response = Response<BoxBody>>,
+    S: Service<Request<Body>, Response = Response<Body>>,
 {
     fn response(&self, status: StatusCode) -> ResponseFuture<S::Future> {
         ResponseFuture {
@@ -53,7 +53,7 @@ where
                 res: Some(
                     Response::builder()
                         .status(status)
-                        .body(BoxBody::default())
+                        .body(Body::default())
                         .unwrap(),
                 ),
             },
@@ -61,9 +61,11 @@ where
     }
 }
 
-impl<S> Service<Request<BoxBody>> for GrpcWebService<S>
+impl<S, B> Service<Request<B>> for GrpcWebService<S>
 where
-    S: Service<Request<BoxBody>, Response = Response<BoxBody>>,
+    S: Service<Request<Body>, Response = Response<Body>>,
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<crate::BoxError> + fmt::Display,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -73,7 +75,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
+    fn call(&mut self, req: Request<B>) -> Self::Future {
         match RequestKind::new(req.headers(), req.method(), req.version()) {
             // A valid grpc-web request, regardless of HTTP version.
             //
@@ -113,7 +115,7 @@ where
                 debug!(kind = "other h2", content_type = ?req.headers().get(header::CONTENT_TYPE));
                 ResponseFuture {
                     case: Case::Other {
-                        future: self.inner.call(req),
+                        future: self.inner.call(req.map(Body::new)),
                     },
                 }
             }
@@ -128,7 +130,6 @@ where
 }
 
 /// Response future for the [`GrpcWebService`].
-#[allow(missing_debug_implementations)]
 #[pin_project]
 #[must_use = "futures do nothing unless polled"]
 pub struct ResponseFuture<F> {
@@ -148,15 +149,15 @@ enum Case<F> {
         future: F,
     },
     ImmediateResponse {
-        res: Option<Response<BoxBody>>,
+        res: Option<Response<Body>>,
     },
 }
 
 impl<F, E> Future for ResponseFuture<F>
 where
-    F: Future<Output = Result<Response<BoxBody>, E>>,
+    F: Future<Output = Result<Response<Body>, E>>,
 {
-    type Output = Result<Response<BoxBody>, E>;
+    type Output = Result<Response<Body>, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
@@ -177,6 +178,12 @@ impl<S: NamedService> NamedService for GrpcWebService<S> {
     const NAME: &'static str = S::NAME;
 }
 
+impl<F> fmt::Debug for ResponseFuture<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseFuture").finish()
+    }
+}
+
 impl<'a> RequestKind<'a> {
     fn new(headers: &'a HeaderMap, method: &'a Method, version: Version) -> Self {
         if is_grpc_web(headers) {
@@ -194,7 +201,11 @@ impl<'a> RequestKind<'a> {
 // Mutating request headers to conform to a gRPC request is not really
 // necessary for us at this point. We could remove most of these except
 // maybe for inserting `header::TE`, which tonic should check?
-fn coerce_request(mut req: Request<BoxBody>, encoding: Encoding) -> Request<BoxBody> {
+fn coerce_request<B>(mut req: Request<B>, encoding: Encoding) -> Request<Body>
+where
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<crate::BoxError> + fmt::Display,
+{
     req.headers_mut().remove(header::CONTENT_LENGTH);
 
     req.headers_mut()
@@ -208,13 +219,17 @@ fn coerce_request(mut req: Request<BoxBody>, encoding: Encoding) -> Request<BoxB
         HeaderValue::from_static("identity,deflate,gzip"),
     );
 
-    req.map(|b| GrpcWebCall::request(b, encoding).boxed_unsync())
+    req.map(|b| Body::new(GrpcWebCall::request(b, encoding)))
 }
 
-fn coerce_response(res: Response<BoxBody>, encoding: Encoding) -> Response<BoxBody> {
+fn coerce_response<B>(res: Response<B>, encoding: Encoding) -> Response<Body>
+where
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<crate::BoxError> + fmt::Display,
+{
     let mut res = res
         .map(|b| GrpcWebCall::response(b, encoding))
-        .map(BoxBody::new);
+        .map(Body::new);
 
     res.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -238,8 +253,8 @@ mod tests {
     #[derive(Debug, Clone)]
     struct Svc;
 
-    impl tower_service::Service<Request<BoxBody>> for Svc {
-        type Response = Response<BoxBody>;
+    impl tower_service::Service<Request<Body>> for Svc {
+        type Response = Response<Body>;
         type Error = String;
         type Future = BoxFuture<Self::Response, Self::Error>;
 
@@ -247,8 +262,8 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _: Request<BoxBody>) -> Self::Future {
-            Box::pin(async { Ok(Response::new(BoxBody::default())) })
+        fn call(&mut self, _: Request<Body>) -> Self::Future {
+            Box::pin(async { Ok(Response::new(Body::default())) })
         }
     }
 
@@ -258,7 +273,7 @@ mod tests {
 
     fn enable<S>(service: S) -> tower_http::cors::Cors<GrpcWebService<S>>
     where
-        S: Service<http::Request<BoxBody>, Response = http::Response<BoxBody>>,
+        S: Service<http::Request<Body>, Response = http::Response<Body>>,
     {
         tower_layer::Stack::new(
             crate::GrpcWebLayer::new(),
@@ -271,12 +286,12 @@ mod tests {
         use super::*;
         use tower_layer::Layer;
 
-        fn request() -> Request<BoxBody> {
+        fn request() -> Request<Body> {
             Request::builder()
                 .method(Method::POST)
                 .header(CONTENT_TYPE, GRPC_WEB)
                 .header(ORIGIN, "http://example.com")
-                .body(BoxBody::default())
+                .body(Body::default())
                 .unwrap()
         }
 
@@ -352,13 +367,13 @@ mod tests {
     mod options {
         use super::*;
 
-        fn request() -> Request<BoxBody> {
+        fn request() -> Request<Body> {
             Request::builder()
                 .method(Method::OPTIONS)
                 .header(ORIGIN, "http://example.com")
                 .header(ACCESS_CONTROL_REQUEST_HEADERS, "x-grpc-web")
                 .header(ACCESS_CONTROL_REQUEST_METHOD, "POST")
-                .body(BoxBody::default())
+                .body(Body::default())
                 .unwrap()
         }
 
@@ -374,11 +389,11 @@ mod tests {
     mod grpc {
         use super::*;
 
-        fn request() -> Request<BoxBody> {
+        fn request() -> Request<Body> {
             Request::builder()
                 .version(Version::HTTP_2)
                 .header(CONTENT_TYPE, GRPC_CONTENT_TYPE)
-                .body(BoxBody::default())
+                .body(Body::default())
                 .unwrap()
         }
 
@@ -398,7 +413,7 @@ mod tests {
 
             let req = Request::builder()
                 .header(CONTENT_TYPE, GRPC_CONTENT_TYPE)
-                .body(BoxBody::default())
+                .body(Body::default())
                 .unwrap();
 
             let res = svc.call(req).await.unwrap();
@@ -426,10 +441,10 @@ mod tests {
     mod other {
         use super::*;
 
-        fn request() -> Request<BoxBody> {
+        fn request() -> Request<Body> {
             Request::builder()
                 .header(CONTENT_TYPE, "application/text")
-                .body(BoxBody::default())
+                .body(Body::default())
                 .unwrap()
         }
 

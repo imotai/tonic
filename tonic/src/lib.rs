@@ -24,9 +24,10 @@
 //! - `router`: Enables the [`axum`] based service router. Enabled by default.
 //! - `codegen`: Enables all the required exports and optional dependencies required
 //!   for [`tonic-build`]. Enabled by default.
-//! - `tls`: Enables the [`rustls`] based TLS options for the `transport` feature. Not
-//!   enabled by default.
-//! - `tls-roots`: Deprecated. An alias to `tls-native-roots` feature.
+//! - `tls-ring`: Enables the [`rustls`] based TLS options for the `transport` feature using
+//!   the [`ring`]` libcrypto provider. Not enabled by default.
+//! - `tls-aws-lc`: Enables the [`rustls`] based TLS options for the `transport` feature using
+//!   the [`aws-lc-rs`] libcrypto provider. Not enabled by default.
 //! - `tls-native-roots`: Adds system trust roots to [`rustls`]-based gRPC clients using the
 //!   [`rustls-native-certs`] crate. Not enabled by default.
 //! - `tls-webpki-roots`: Add the standard trust roots from the [`webpki-roots`] crate to
@@ -71,6 +72,7 @@
 //! [`hyper`]: https://docs.rs/hyper
 //! [`tower`]: https://docs.rs/tower
 //! [`tonic-build`]: https://docs.rs/tonic-build
+//! [`ring`]: https://docs.rs/ring
 //! [`tonic-examples`]: https://github.com/hyperium/tonic/tree/master/examples
 //! [`Codec`]: codec/trait.Codec.html
 //! [`Channel`]: transport/struct.Channel.html

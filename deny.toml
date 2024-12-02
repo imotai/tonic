@@ -1,26 +1,30 @@
 [graph]
 all-features = true
+exclude = ["examples"]
 
 [bans]
 multiple-versions = "deny"
 deny = [
     # color-backtrace is nice but brings in too many dependencies and that are often outdated, so not worth it for us.
-    { name = "color-backtrace" },
+    { crate = "color-backtrace" },
 
     # dirs crate has a lot of dependencies and there are better alternatives
-    { name = "dirs" },
-    { name = "dirs-sys" },
+    { crate = "dirs" },
+    { crate = "dirs-sys" },
 
     # deprecated
-    { name = "quickersort" },
+    { crate = "quickersort" },
 
     # term is not fully maintained, and termcolor is replacing it
-    { name = "term" },
+    { crate = "term" },
+]
+skip = [
+    { crate = "itertools@0.12.1", reason = "aws-lc-sys depends on bindgen which depends on it" },
+    { crate = "sync_wrapper@0.1.2", reason = "tower depends on it" }
 ]
 skip-tree = [
-    { name = "windows-sys" },
-    { name = "hermit-abi" },
-    { name = "examples" },
+    { crate = "windows-sys" },
+    { crate = "hermit-abi" },
 ]
 
 [licenses]
@@ -33,13 +37,13 @@ allow = [
     "MIT",
     "OpenSSL",
     "Zlib",
-    "Unicode-DFS-2016",
+    "Unicode-3.0",
     "MPL-2.0",
     "BSD-3-Clause",
 ]
 
 [[licenses.clarify]]
-name = "ring"
+crate = "ring"
 # SPDX considers OpenSSL to encompass both the OpenSSL and SSLeay licenses
 # https://spdx.org/licenses/OpenSSL.html
 # ISC - Both BoringSSL and ring use this for their new files
