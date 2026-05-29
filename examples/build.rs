@@ -2,6 +2,17 @@ use std::{env, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Optionally use protoc-gen-rust-grpc's protoc for prost. protoc-gen-rust-grpc will skip its
+    // build when PROTOC_GEN_RUST_GRPC_NO_BUILD=1 (used in gRPC's CI), so we check that the binary
+    // exists.
+    #[cfg(feature = "protoc-gen-rust-grpc")]
+    if protoc_gen_rust_grpc::protoc().exists() {
+        unsafe {
+            env::set_var("PROTOC", protoc_gen_rust_grpc::protoc());
+        }
+    }
+
     tonic_prost_build::configure()
         .compile_protos(&["proto/routeguide/route_guide.proto"], &["proto"])
         .unwrap();
