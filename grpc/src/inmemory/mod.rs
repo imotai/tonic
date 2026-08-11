@@ -49,7 +49,6 @@ use crate::client::ResponseStreamItem;
 use crate::client::SendOptions as ClientSendOptions;
 use crate::client::SendStream as ClientSendStream;
 use crate::client::Trailers as ClientTrailers;
-use crate::client::name_resolution::Address;
 use crate::client::name_resolution::ChannelController as ResolverChannelController;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::Resolver;
@@ -63,6 +62,7 @@ use crate::client::transport::GLOBAL_TRANSPORT_REGISTRY;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
+use crate::core::Address;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::credentials::SecurityLevel;
@@ -416,7 +416,7 @@ impl Transport for InMemoryTransport {
 
     async fn connect(
         &self,
-        target: String,
+        address: &Address,
         _runtime: GrpcRuntime,
         _security_opts: &SecurityOpts,
         _options: &TransportOptions,
@@ -428,9 +428,10 @@ impl Transport for InMemoryTransport {
         ),
         String,
     > {
+        let target = &*address.address;
         let listeners = LISTENERS.lock().unwrap();
         let s = listeners
-            .get(&target)
+            .get(target)
             .ok_or_else(|| format!("no listener for target: {}", target))?;
 
         let (closed_tx, closed_rx) = oneshot::channel();
