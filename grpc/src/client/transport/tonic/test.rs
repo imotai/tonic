@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use bytes::Buf;
 use bytes::Bytes;
+use h2::Reason;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
@@ -1057,4 +1058,79 @@ impl Echo for EchoService {
         }
         Ok(response)
     }
+}
+
+#[tokio::test]
+async fn tonic_transport_recv_drop_sends_rst_stream() {
+    super::reg();
+    let listener = TcpListener::bind("localhost:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+
+        let result = connection.accept().await.unwrap();
+        let (request, _respond) = result.unwrap();
+        let mut body = request.into_body();
+
+        match body.data().await {
+            Some(Ok(_)) => {
+                panic!("Expected error or EOF, got data");
+            }
+            Some(Err(err)) => {
+                println!("Got expected error: {:?}", err);
+                assert_eq!(err.reason(), Some(Reason::CANCEL));
+            }
+            None => {
+                panic!("Expected RST_STREAM, got clean close (EOS)");
+            }
+        };
+    });
+
+    let builder = GLOBAL_TRANSPORT_REGISTRY
+        .get_transport(TCP_IP_NETWORK_TYPE)
+        .unwrap();
+    let config = Arc::new(TransportOptions::default());
+    let securty_opts = SecurityOpts {
+        credentials: LocalChannelCredentials::new_arc(),
+        authority: Authority::new("localhost".to_string(), None),
+        handshake_info: ClientHandshakeInfo::default(),
+    };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
+
+    let (conn, _sec_info, _disconnection_listener) = builder
+        .dyn_connect(
+            &address,
+            GrpcRuntime::new(TokioRuntime::default()),
+            &securty_opts,
+            &config,
+        )
+        .await
+        .unwrap();
+
+    let (mut tx, rx) = conn
+        .dyn_invoke(
+            RequestHeaders::new()
+                .with_method_name("/grpc.examples.echo.Echo/BidirectionalStreamingEcho"),
+            CallOptions::default(),
+        )
+        .await;
+
+    // Drop the receiver to trigger cancellation.
+    drop(rx);
+
+    // Wait for the server to verify the reset.
+    tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await
+        .expect("Test timed out waiting for server to verify reset")
+        .unwrap();
+
+    // Verify the send stream has ended.
+    let req = WrappedEchoRequest(EchoRequest::default());
+    assert!(tx.send(&req, SendOptions::default()).await.is_err())
 }
