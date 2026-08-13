@@ -43,7 +43,7 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 use tokio::sync::watch;
 
-use crate::client::route::{AcquiredConfig, RouteDecision, RouteInput, Router};
+use crate::client::route::{AcquiredConfig, RouteDecision, RouteInput, Router, RoutingSnapshot};
 use crate::common::async_util::AbortOnDrop;
 use crate::xds::cache::XdsCache;
 use crate::xds::resource::hash_policy::HashPolicyConfig;
@@ -66,7 +66,7 @@ const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// config is available, matching standard gRPC behavior where RPCs wait for the
 /// resolver's first update. Subsequent RPCs read the config lock-free.
 pub(crate) struct XdsRouter {
-    route_config: Arc<ArcSwapOption<RouteConfigResource>>,
+    route_config: Arc<ArcSwapOption<RoutingSnapshot>>,
     ready_rx: watch::Receiver<bool>,
     _watch_task: AbortOnDrop,
 }
@@ -85,7 +85,7 @@ impl XdsRouter {
         let handle = tokio::spawn(async move {
             let mut ready_tx = Some(ready_tx);
             while let Some(config) = watcher.next().await {
-                rc.store(Some(config));
+                rc.store(Some(Arc::new(RoutingSnapshot::new(config))));
                 // Signal readiness on the first config, then drop the sender.
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(true);
@@ -100,7 +100,7 @@ impl XdsRouter {
     }
 
     /// The route config currently in effect, or `None` if none has arrived yet.
-    pub(crate) fn snapshot(&self) -> Option<Arc<RouteConfigResource>> {
+    pub(crate) fn snapshot(&self) -> Option<Arc<RoutingSnapshot>> {
         self.route_config.load_full()
     }
 }
@@ -126,7 +126,7 @@ impl Router for XdsRouter {
     fn route(
         &self,
         input: &RouteInput<'_>,
-        config: &RouteConfigResource,
+        config: &RoutingSnapshot,
     ) -> Result<RouteDecision, RoutingError> {
         resolve_route(config, input.authority, input.headers)
     }
@@ -134,7 +134,7 @@ impl Router for XdsRouter {
 
 /// Resolve a route decision from the given config, authority, and headers.
 fn resolve_route(
-    rc: &RouteConfigResource,
+    rc: &RoutingSnapshot,
     authority: &str,
     headers: &http::HeaderMap,
 ) -> Result<RouteDecision, RoutingError> {
@@ -142,13 +142,17 @@ fn resolve_route(
         .get(":path")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("/");
-    let action = rc.route(authority, path, headers)?;
-    let cluster = match action {
+    let route = rc.matched_route(authority, path, headers)?;
+    let cluster = match &route.action {
         RouteConfigAction::Cluster(name) => name.clone(),
         RouteConfigAction::WeightedClusters(clusters) => select_weighted_cluster(clusters)
             .ok_or(RoutingError::EmptyWeightedClusters)?
             .to_string(),
     };
+
+    // Retry config for the matched route, from the same snapshot we routed on so
+    // retry and routing act on one RDS version.
+    let retry_config = rc.retry_for(route.retry_config.as_ref());
 
     // gRFC A42 ring-hash request hash. The policy list is empty for now, so
     // `request_hash` resolves to `None` and the ring-hash picker falls back to a
@@ -161,6 +165,7 @@ fn resolve_route(
     Ok(RouteDecision {
         cluster,
         request_hash,
+        retry_config,
     })
 }
 
@@ -181,19 +186,37 @@ impl RouteConfigResource {
     /// Match a request and return the target cluster action.
     ///
     /// Performs domain matching on the authority, then walks routes in order
-    /// to find the first match.
+    /// to find the first match. Test-only convenience wrapper around
+    /// [`matched_route`](Self::matched_route); production routing uses
+    /// `matched_route` so it can also read the matched route's retry policy.
+    #[cfg(test)]
     pub(crate) fn route(
         &self,
         authority: &str,
         path: &str,
         headers: &http::HeaderMap,
     ) -> Result<&RouteConfigAction, RoutingError> {
+        self.matched_route(authority, path, headers)
+            .map(|route| &route.action)
+    }
+
+    /// Match a request and return the full matched [`RouteConfig`].
+    ///
+    /// Performs domain matching on the authority, then walks routes in order to
+    /// find the first match. Returns the whole matched route so callers can read
+    /// per-route fields (e.g. the retry policy) alongside the action.
+    pub(crate) fn matched_route(
+        &self,
+        authority: &str,
+        path: &str,
+        headers: &http::HeaderMap,
+    ) -> Result<&RouteConfig, RoutingError> {
         let vh = find_best_matching_virtual_host(authority, &self.virtual_hosts)
             .ok_or_else(|| RoutingError::NoMatchingVirtualHost(authority.to_string()))?;
 
         for route in &vh.routes {
             if route_matches(route, path, headers) {
-                return Ok(&route.action);
+                return Ok(route);
             }
         }
 
@@ -391,6 +414,7 @@ mod tests {
                 match_fraction: None,
             },
             action: RouteConfigAction::Cluster(cluster.into()),
+            retry_config: None,
         }
     }
 
@@ -623,6 +647,7 @@ mod tests {
                     match_fraction: None,
                 },
                 action: RouteConfigAction::Cluster("c1".into()),
+                retry_config: None,
             }],
         }]);
         let headers = http::HeaderMap::new();
@@ -646,6 +671,7 @@ mod tests {
                     match_fraction: None,
                 },
                 action: RouteConfigAction::Cluster("c1".into()),
+                retry_config: None,
             }],
         }]);
         let headers = http::HeaderMap::new();
@@ -677,6 +703,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("cluster-prod".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "cluster-default"),
             ],
@@ -714,6 +741,7 @@ mod tests {
                         weight: 30,
                     },
                 ]),
+                retry_config: None,
             }],
         }]);
         let action = rc.route("host", "/", &http::HeaderMap::new()).unwrap();
@@ -734,6 +762,7 @@ mod tests {
                         match_fraction: Some(0),
                     },
                     action: RouteConfigAction::Cluster("never".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "fallback"),
             ],
@@ -757,6 +786,7 @@ mod tests {
                     match_fraction: Some(1_000_000),
                 },
                 action: RouteConfigAction::Cluster("always".into()),
+                retry_config: None,
             }],
         }]);
         for _ in 0..100 {
@@ -786,6 +816,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("versioned".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "default"),
             ],
@@ -881,6 +912,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("grpc".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "fallback"),
             ],
@@ -916,6 +948,7 @@ mod tests {
                     match_fraction: None,
                 },
                 action: RouteConfigAction::Cluster("matched".into()),
+                retry_config: None,
             }],
         }]);
 
@@ -953,6 +986,7 @@ mod tests {
                             match_fraction: None,
                         },
                         action: RouteConfigAction::Cluster("matched".into()),
+                        retry_config: None,
                     },
                     simple_route("/", "fallback"),
                 ],
@@ -1011,6 +1045,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("matched".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "fallback"),
             ],
@@ -1052,6 +1087,7 @@ mod tests {
                         match_fraction: None,
                     },
                     action: RouteConfigAction::Cluster("matched".into()),
+                    retry_config: None,
                 },
                 simple_route("/", "fallback"),
             ],
