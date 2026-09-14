@@ -21,9 +21,9 @@ unnecessary_semicolon = "deny"
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [
+    "async_trait::async_trait",
     "bytes::*",
     "tonic::*",
-    "futures_core::stream::Stream",
     "tokio::sync::oneshot::*",
 ]
 
